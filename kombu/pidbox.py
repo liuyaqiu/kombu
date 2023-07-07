@@ -34,6 +34,11 @@ __all__ = ('Node', 'Mailbox')
 logger = get_logger(__name__)
 debug, error = logger.debug, logger.error
 
+# rabbitmq queue types.
+RMQ_CLASSIC_QUEUE = 'classic'
+RMQ_QUORUM_QUEUE = 'quorum'
+RMQ_STREAM_QUEUE = 'stream'
+
 
 class Node:
     """Mailbox node."""
@@ -54,7 +59,7 @@ class Node:
     channel = None
 
     def __init__(self, hostname, state=None, channel=None,
-                 handlers=None, mailbox=None):
+                 handlers=None, mailbox=None, queue_type=RMQ_CLASSIC_QUEUE):
         self.channel = channel
         self.mailbox = mailbox
         self.hostname = hostname
@@ -63,6 +68,8 @@ class Node:
         if handlers is None:
             handlers = {}
         self.handlers = handlers
+        self.msg_index = 0
+        self.queue_type = queue_type
 
     def Consumer(self, channel=None, no_ack=True, accept=None, **options):
         queue = self.mailbox.get_queue(self.hostname)
@@ -70,11 +77,18 @@ class Node:
         def verify_exclusive(name, messages, consumers):
             if consumers:
                 warnings.warn(W_PIDBOX_IN_USE.format(node=self))
-        queue.on_declared = verify_exclusive
+        if self.queue_type == RMQ_STREAM_QUEUE:
+            no_ack = False
+            prefetch_count = 32
+        else:
+            # Only verify when not using stream queue.
+            prefetch_count = None
+            queue.on_declared = verify_exclusive
 
         return Consumer(
             channel or self.channel, [queue], no_ack=no_ack,
             accept=self.mailbox.accept if accept is None else accept,
+            prefetch_count=prefetch_count,
             **options
         )
 
@@ -86,8 +100,18 @@ class Node:
         error('Cannot decode message: %r', exc, exc_info=1)
 
     def listen(self, channel=None, callback=None):
+        def handle_message_by_ack(body, message):
+            if callback:
+                callback(body, message)
+            else:
+                self.handle_message(message)
+            if self.queue_type == RMQ_STREAM_QUEUE:
+                debug(f"pidbox ack message[{self.msg_index}]: {body}")
+                message.ack()
+            self.msg_index += 1
         consumer = self.Consumer(channel=channel,
-                                 callbacks=[callback or self.handle_message],
+                                 no_ack=False,
+                                 callbacks=[handle_message_by_ack],
                                  on_decode_error=self.on_decode_error)
         consumer.consume()
         return consumer
@@ -181,12 +205,13 @@ class Mailbox:
                  type='direct', connection=None, clock=None,
                  accept=None, serializer=None, producer_pool=None,
                  queue_ttl=None, queue_expires=None,
-                 reply_queue_ttl=None, reply_queue_expires=10.0):
+                 reply_queue_ttl=None, reply_queue_expires=10.0,
+                 queue_type=RMQ_CLASSIC_QUEUE):
         self.namespace = namespace
         self.connection = connection
         self.type = type
         self.clock = LamportClock() if clock is None else clock
-        self.exchange = self._get_exchange(self.namespace, self.type)
+        self.exchange = self._get_exchange(self.namespace, type)
         self.reply_exchange = self._get_reply_exchange(self.namespace)
         self.unclaimed = defaultdict(deque)
         self.accept = self.accept if accept is None else accept
@@ -196,6 +221,7 @@ class Mailbox:
         self.reply_queue_ttl = reply_queue_ttl
         self.reply_queue_expires = reply_queue_expires
         self._producer_pool = producer_pool
+        self.queue_type = queue_type
 
     def __call__(self, connection):
         bound = copy(self)
@@ -204,7 +230,8 @@ class Mailbox:
 
     def Node(self, hostname=None, state=None, channel=None, handlers=None):
         hostname = hostname or socket.gethostname()
-        return self.node_cls(hostname, state, channel, handlers, mailbox=self)
+        return self.node_cls(hostname, state, channel, handlers, mailbox=self,
+                             queue_type=self.queue_type)
 
     def call(self, destination, command, kwargs=None,
              timeout=None, callback=None, channel=None):
@@ -232,29 +259,55 @@ class Mailbox:
 
     def get_reply_queue(self):
         oid = self.oid
-        return Queue(
-            f'{oid}.{self.reply_exchange.name}',
-            exchange=self.reply_exchange,
-            routing_key=oid,
-            durable=False,
-            auto_delete=True,
-            expires=self.reply_queue_expires,
-            message_ttl=self.reply_queue_ttl,
-        )
+        if self.queue_type == RMQ_STREAM_QUEUE:
+            # all worker share the same stream queue.
+            queue_arguments = {
+                "x-queue-type": "stream",
+                "max-length-bytes": 1e9,  # 10GB in disk.
+            }
+            return Queue(
+                f'stream.{self.reply_exchange.name}',
+                exchange=self.reply_exchange,
+                routing_key=oid,
+                queue_arguments=queue_arguments
+            )
+        else:
+            return Queue(
+                f'{oid}.{self.reply_exchange.name}',
+                exchange=self.reply_exchange,
+                routing_key=oid,
+                durable=False,
+                auto_delete=True,
+                expires=self.reply_queue_expires,
+                message_ttl=self.reply_queue_ttl,
+            )
 
     @cached_property
     def reply_queue(self):
         return self.get_reply_queue()
 
     def get_queue(self, hostname):
-        return Queue(
-            f'{hostname}.{self.namespace}.pidbox',
-            exchange=self.exchange,
-            durable=False,
-            auto_delete=True,
-            expires=self.queue_expires,
-            message_ttl=self.queue_ttl,
-        )
+        # Start consuming messages from the queues
+        if self.queue_type == RMQ_STREAM_QUEUE:
+            # all worker share the same stream queue.
+            queue_arguments = {
+                "x-queue-type": "stream",
+                "max-length-bytes": 1e9,  # 10GB in disk.
+            }
+            return Queue(
+                f'stream.{self.namespace}.pidbox',
+                exchange=self.exchange,
+                queue_arguments=queue_arguments
+            )
+        else:
+            return Queue(
+                f'{hostname}.{self.namespace}.pidbox',
+                exchange=self.exchange,
+                durable=False,
+                auto_delete=True,
+                expires=self.queue_expires,
+                message_ttl=self.queue_ttl,
+            )
 
     @contextmanager
     def producer_or_acquire(self, producer=None, channel=None):
@@ -393,10 +446,12 @@ class Mailbox:
             chan.after_reply_message_received(queue.name)
 
     def _get_exchange(self, namespace, type):
-        return Exchange(self.exchange_fmt % namespace,
-                        type=type,
-                        durable=False,
-                        delivery_mode='transient')
+        exchange = Exchange(self.exchange_fmt % namespace,
+                            type=type,
+                            durable=False,
+                            delivery_mode='transient')
+        error(f"Exchange: {exchange}, {type}")
+        return exchange
 
     def _get_reply_exchange(self, namespace):
         return Exchange(self.reply_exchange_fmt % namespace,
