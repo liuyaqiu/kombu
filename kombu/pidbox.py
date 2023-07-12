@@ -39,6 +39,14 @@ RMQ_CLASSIC_QUEUE = 'classic'
 RMQ_QUORUM_QUEUE = 'quorum'
 RMQ_STREAM_QUEUE = 'stream'
 
+STREAM_QUEUE_PREFETCH = 32
+
+
+def default_prefetch_count(queue_type):
+    if queue_type == RMQ_STREAM_QUEUE:
+        return STREAM_QUEUE_PREFETCH
+    return None
+
 
 class Node:
     """Mailbox node."""
@@ -79,16 +87,16 @@ class Node:
                 warnings.warn(W_PIDBOX_IN_USE.format(node=self))
         if self.queue_type == RMQ_STREAM_QUEUE:
             no_ack = False
-            prefetch_count = 32
         else:
             # Only verify when not using stream queue.
-            prefetch_count = None
             queue.on_declared = verify_exclusive
 
+        prefetch_count = options.get('prefetch_count',
+                                     default_prefetch_count(self.queue_type))
+        options['prefetch_count'] = prefetch_count
         return Consumer(
             channel or self.channel, [queue], no_ack=no_ack,
             accept=self.mailbox.accept if accept is None else accept,
-            prefetch_count=prefetch_count,
             **options
         )
 
@@ -408,7 +416,11 @@ class Mailbox:
             accept = self.accept
         chan = channel or self.connection.default_channel
         queue = self.reply_queue
-        consumer = Consumer(chan, [queue], accept=accept, no_ack=True)
+        prefetch_count = default_prefetch_count(self.queue_type)
+        error(f"{prefetch_count=}")
+        no_ack = (self.queue_type != RMQ_STREAM_QUEUE)
+        consumer = Consumer(chan, [queue], accept=accept, no_ack=no_ack,
+                            prefetch_count=prefetch_count)
         responses = []
         unclaimed = self.unclaimed
         adjust_clock = self.clock.adjust
